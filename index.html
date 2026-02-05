@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Melodica Invaders: Virtuoso Edition</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #fafafa; font-family: 'Segoe UI', sans-serif; user-select: none; overflow: hidden; }
+    #gameContainer { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+    #ui { margin-bottom: 10px; font-weight: bold; color: #333; font-family: monospace; z-index: 5; text-align: center; line-height: 1.5; }
+    canvas { border: 2px solid #333; background: #fff; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.9); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; }
+    button { padding: 15px 30px; font-size: 20px; cursor: pointer; background: #43c28c; border: none; color: white; border-radius: 8px; }
+    .hidden { display: none !important; }
+    .stat-box { display: inline-block; min-width: 120px; border: 1px solid #ccc; padding: 2px 8px; margin: 0 5px; border-radius: 4px; background: #eee; }
+  </style>
+</head>
+<body>
+  <div id="gameContainer">
+    <div id="ui">
+      <div class="stat-box">SCORE: <span id="scoreLabel">0</span></div>
+      <div class="stat-box">LIVES: <span id="livesLabel">4</span></div>
+      <div class="stat-box">HEALTH: <span id="healthLabel">3</span>/3</div>
+      <div class="stat-box">LEVEL: <span id="levelLabel">1</span></div>
+    </div>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <div id="overlay">
+      <h1>MELODICA INVADERS</h1>
+      <p>3 Hits = Loss of 1 Life | Space to play notes</p>
+      <button id="startButton">START PERFORMANCE</button>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    const scoreLabel = document.getElementById("scoreLabel");
+    const livesLabel = document.getElementById("livesLabel");
+    const healthLabel = document.getElementById("healthLabel");
+    const levelLabel = document.getElementById("levelLabel");
+    const overlay = document.getElementById("overlay");
+    const startButton = document.getElementById("startButton");
+
+    const WIDTH = canvas.width;
+    const HEIGHT = canvas.height;
+
+    // --- Audio Logic ---
+    let audioCtx = null;
+    let bassClefOsc = null;
+    let bassClefGain = null;
+
+    function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+    /**
+     * Updated playNote with randomized volume and duration
+     */
+    function playNote(midi, baseVolume = 0.24, type = "square") {
+      if (!audioCtx) return;
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      
+      // Variation: +/- 15% on volume and duration
+      const volVar = baseVolume * (0.85 + Math.random() * 0.3);
+      const durVar = 0.35 + Math.random() * 0.25;
+
+      osc.type = type;
+      osc.frequency.setValueAtTime(midiToFreq(midi), now);
+      
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(volVar, now + 0.08); 
+      gain.gain.exponentialRampToValueAtTime(0.001, now + durVar); 
+      
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(); osc.stop(now + durVar + 0.1);
+    }
+
+    /**
+     * Quick descending glissando G3 (55) to G1 (31)
+     */
+    function playGlissando() {
+      if (!audioCtx) return;
+      const now = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(midiToFreq(55), now);
+      osc.frequency.exponentialRampToValueAtTime(midiToFreq(31), now + 0.5);
+
+      gain.gain.setValueAtTime(0.4, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(); osc.stop(now + 0.5);
+    }
+
+    function startBassClefDrone() {
+      if (!audioCtx || bassClefOsc) return;
+      bassClefOsc = audioCtx.createOscillator();
+      bassClefGain = audioCtx.createGain();
+      bassClefOsc.type = "sine";
+      bassClefOsc.frequency.setValueAtTime(110, audioCtx.currentTime);
+      bassClefGain.gain.setValueAtTime(0, audioCtx.currentTime);
+      bassClefGain.gain.linearRampToValueAtTime(0.2, audioCtx.currentTime + 0.2);
+      bassClefOsc.connect(bassClefGain);
+      bassClefGain.connect(audioCtx.destination);
+      bassClefOsc.start();
+    }
+
+    function stopBassClefDrone() {
+      if (bassClefOsc) {
+        const now = audioCtx.currentTime;
+        bassClefGain.gain.cancelScheduledValues(now);
+        bassClefGain.gain.linearRampToValueAtTime(0, now + 0.1);
+        bassClefOsc.stop(now + 0.2);
+        bassClefOsc = null;
+      }
+    }
+
+    // --- Game Logic ---
+    const player = { width: 60, height: 135, x: 370, y: 440, speed: 7, cooldown: 0, health: 3 };
+    const playerImg = new Image(); playerImg.src = "melodica.png";
+    const bullets = [], enemyBullets = [], particles = [], enemies = [];
+    let score = 0, level = 1, lives = 4, gameOver = false, gameActive = false;
+    let enemyDir = 1, enemySpeed = 1;
+    let bassClef = null, bassClefSpawnCooldown = 250; 
+    const powerUp = { active: false, expiresAt: 0 };
+    const keys = { left: false, right: false, space: false };
+
+    function createWave() {
+      enemies.length = 0;
+      for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 9; c++) {
+          enemies.push({ x: 100 + c * 70, y: 80 + r * 50, width: 50, height: 30 });
+        }
+      }
+    }
+
+    function update() {
+      if (!gameActive || gameOver) return;
+
+      if (keys.left) player.x -= player.speed;
+      if (keys.right) player.x += player.speed;
+      player.x = Math.max(20, Math.min(WIDTH - player.width - 20, player.x));
+
+      if (player.cooldown > 0) player.cooldown--;
+      if (keys.space && player.cooldown === 0) {
+        const midi = Math.floor(Math.random() * 36) + 55;
+        // Playing at 60% of original volume (original was 0.4, 60% = 0.24)
+        playNote(midi, 0.24);
+        bullets.push({ x: player.x + 30, y: player.y, vy: 9 });
+        if (powerUp.active) {
+            playNote(midi + 4, 0.18);
+            bullets.push({ x: player.x + 10, y: player.y, vy: 9 }, { x: player.x + 50, y: player.y, vy: 9 });
+        }
+        player.cooldown = 16;
+      }
+
+      bullets.forEach((b, i) => { b.y -= b.vy; if (b.y < 0) bullets.splice(i, 1); });
+      enemyBullets.forEach((eb, i) => { 
+        eb.y += 4; if (eb.y > HEIGHT) enemyBullets.splice(i, 1); 
+        if (eb.x > player.x && eb.x < player.x + player.width && eb.y > player.y && eb.y < player.y + player.height) {
+            enemyBullets.splice(i, 1); 
+            onHit(); 
+        }
+      });
+
+      let edge = false;
+      enemies.forEach(e => {
+        e.x += enemyDir * enemySpeed;
+        if (e.x < 20 || e.x > WIDTH - 70) edge = true;
+        if (Math.random() < 0.001 * level) enemyBullets.push({ x: e.x + 25, y: e.y + 30 });
+      });
+      if (edge) { enemyDir *= -1; enemies.forEach(e => e.y += 15); }
+
+      if (!bassClef) {
+        bassClefSpawnCooldown--;
+        if (bassClefSpawnCooldown <= 0) {
+          bassClef = { x: -60, y: 50, width: 40, height: 40, speed: 3.5 };
+          startBassClefDrone();
+        }
+      } else {
+        bassClef.x += bassClef.speed;
+        if (bassClef.x > WIDTH + 60) { stopBassClefDrone(); bassClef = null; bassClefSpawnCooldown = 300; }
+      }
+
+      bullets.forEach((b, bi) => {
+        enemies.forEach((e, ei) => {
+          if (b.x > e.x && b.x < e.x + e.width && b.y > e.y && b.y < e.y + e.height) {
+            enemies.splice(ei, 1); bullets.splice(bi, 1);
+            score += 10; scoreLabel.textContent = score;
+          }
+        });
+        if (bassClef && b.x > bassClef.x && b.x < bassClef.x + bassClef.width && b.y > bassClef.y && b.y < bassClef.y + bassClef.height) {
+          stopBassClefDrone(); bassClef = null; bullets.splice(bi, 1);
+          powerUp.active = true; powerUp.expiresAt = performance.now() + 8000;
+        }
+      });
+
+      if (enemies.length === 0) { level++; levelLabel.textContent = level; createWave(); enemySpeed += 0.2; }
+      if (powerUp.active && performance.now() > powerUp.expiresAt) powerUp.active = false;
+    }
+
+    /**
+     * 3 Hits per life system
+     */
+    function onHit() {
+      player.health--;
+      playGlissando();
+      healthLabel.textContent = player.health;
+      if (player.health <= 0) {
+        loseLife();
+      }
+    }
+
+    function loseLife() {
+      lives--;
+      livesLabel.textContent = lives;
+      player.health = 3;
+      healthLabel.textContent = player.health;
+      if (lives <= 0) {
+        stopBassClefDrone();
+        gameOver = true;
+        overlay.classList.remove("hidden");
+        overlay.innerHTML = `<h1>CONCERT OVER</h1><p>Final Score: ${score}</p><button onclick="location.reload()">REPLAY</button>`;
+      }
+    }
+
+    function draw() {
+      if (powerUp.active) {
+        const hue = (performance.now() / 30) % 360;
+        ctx.fillStyle = `hsla(${hue}, 30%, 96%, 1)`;
+      } else {
+        ctx.fillStyle = "#fff";
+      }
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+      
+      ctx.strokeStyle = "#eee"; ctx.lineWidth = 1;
+      for (let staff = 0; staff < 6; staff++) {
+        let startY = 100 + (staff * 100);
+        for (let line = 0; line < 5; line++) {
+          ctx.beginPath(); ctx.moveTo(30, startY + (line * 10)); ctx.lineTo(WIDTH - 30, startY + (line * 10)); ctx.stroke();
+        }
+      }
+
+      if (playerImg.complete) ctx.drawImage(playerImg, player.x, player.y, player.width, player.height);
+      
+      ctx.fillStyle = powerUp.active ? "#43c28c" : "black";
+      bullets.forEach(b => { ctx.beginPath(); ctx.arc(b.x, b.y, 6, 0, Math.PI*2); ctx.fill(); ctx.fillRect(b.x+4, b.y-15, 2, 15); });
+
+      ctx.fillStyle = "red";
+      enemyBullets.forEach(eb => { ctx.font = "24px serif"; ctx.fillText("𝄽", eb.x, eb.y); });
+
+      ctx.fillStyle = "#333";
+      enemies.forEach(e => {
+        ctx.font = "20px serif"; ctx.fillText("♫", e.x + 15, e.y + 20);
+        ctx.fillRect(e.x, e.y + 22, e.width, 2);
+      });
+
+      if (bassClef) {
+        ctx.fillStyle = "blue"; ctx.font = "30px serif";
+        ctx.fillText("𝄢", bassClef.x, bassClef.y + 30);
+      }
+
+      requestAnimationFrame(() => { update(); draw(); });
+    }
+
+    startButton.addEventListener("click", () => { initAudio(); gameActive = true; overlay.classList.add("hidden"); createWave(); draw(); });
+    window.addEventListener("keydown", (e) => { if (e.code === "ArrowLeft") keys.left = true; if (e.code === "ArrowRight") keys.right = true; if (e.code === "Space") { keys.space = true; e.preventDefault(); } });
+    window.addEventListener("keyup", (e) => { if (e.code === "ArrowLeft") keys.left = false; if (e.code === "ArrowRight") keys.right = false; if (e.code === "Space") keys.space = false; });
+  </script>
+</body>
+</html>
